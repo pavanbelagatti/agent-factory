@@ -148,6 +148,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           COST=0
           if [ "$AGENT_TYPE" = "claude" ]; then
@@ -159,7 +160,10 @@ jobs:
             COST=$(jq -r '.total_cost_usd // 0' ../agent.json 2>/dev/null || echo 0)
           else
             npm install -g @openai/codex
-            codex exec --full-auto --output-last-message ../summary.md "$(cat ../prompt.md)" || true
+            codex --version
+            # The GitHub runner is already a throwaway VM, so skip Codex's own sandbox (it often can't start there).
+            codex exec --dangerously-bypass-approvals-and-sandbox \
+              --output-last-message ../summary.md "$(cat ../prompt.md)" || true
             [ -s ../summary.md ] || echo "No summary produced." > ../summary.md
           fi
           echo "cost=$COST" >> "$GITHUB_OUTPUT"
