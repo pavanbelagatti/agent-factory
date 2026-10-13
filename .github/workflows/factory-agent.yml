@@ -1,0 +1,230 @@
+# Software factory: one agent run = one slot working one issue.
+# Dispatched by the Port workflows "factory_dispatcher" and "factory_queue_drain".
+#
+# Lives in the central repo  pavanbelagatti/agent-factory  and works on issues in ANY repo of the org.
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   PORT_CLIENT_ID, PORT_CLIENT_SECRET  - Port > ... menu > Credentials
+#   FACTORY_GH_TOKEN                    - fine-grained PAT (or GitHub App token) with Contents, Issues,
+#                                         Pull requests = Read & write on the repos the factory may touch
+#   ANTHROPIC_API_KEY                   - for claude-* slots
+#   OPENAI_API_KEY                      - for codex-* slots
+
+name: Factory agent
+run-name: "${{ inputs.slot_id }} -> ${{ inputs.target_repo }}#${{ inputs.issue_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Repository name (in this org) that the issue lives in
+        required: true
+      issue_number:
+        description: GitHub issue number
+        required: true
+      issue_id:
+        description: Port identifier of the issue entity
+        required: true
+      slot_id:
+        description: Port identifier of the agent slot
+        required: true
+      agent_type:
+        description: claude or codex
+        required: true
+
+# Two runs for the same slot never overlap; the second waits, then the ownership guard sorts it out.
+concurrency:
+  group: agent-slot-${{ inputs.slot_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PORT_API: https://api.port.io/v1   # use https://api.us.port.io/v1 if your Port org is in the US region
+  TARGET: ${{ github.repository_owner }}/${{ inputs.target_repo }}
+  ISSUE_NUMBER: ${{ inputs.issue_number }}
+  ISSUE_ID: ${{ inputs.issue_id }}
+  SLOT_ID: ${{ inputs.slot_id }}
+  AGENT_TYPE: ${{ inputs.agent_type }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Port API helpers
+        run: |
+          cat > "$RUNNER_TEMP/port.sh" <<'EOF'
+          port_token() {
+            jq -n --arg id "$PORT_CLIENT_ID" --arg s "$PORT_CLIENT_SECRET" '{clientId:$id, clientSecret:$s}' \
+              | curl -sf -X POST "$PORT_API/auth/access_token" -H 'Content-Type: application/json' -d @- \
+              | jq -r .accessToken
+          }
+          port_get()   { curl -sf "$PORT_API/blueprints/$1/entities/$2" -H "Authorization: Bearer $(port_token)"; }
+          port_patch() { curl -sf -X PATCH "$PORT_API/blueprints/$1/entities/$2" \
+                           -H "Authorization: Bearer $(port_token)" -H 'Content-Type: application/json' -d "$3" > /dev/null; }
+          now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          EOF
+
+      # Port is the source of truth. If another run won the race for this slot or this issue, back off.
+      - name: Ownership guard
+        id: guard
+        env:
+          PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+          PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+        run: |
+          source "$RUNNER_TEMP/port.sh"
+          SLOT_ISSUE=$(port_get agentSlot "$SLOT_ID" | jq -r '.entity.relations.current_issue // ""')
+          ISSUE_AGENT=$(port_get githubIssue "$ISSUE_ID" | jq -r '.entity.properties.assigned_agent // ""')
+          if [ "$SLOT_ISSUE" != "$ISSUE_ID" ]; then
+            echo "Slot $SLOT_ID now belongs to '$SLOT_ISSUE'. Re-queueing $ISSUE_ID."
+            port_patch githubIssue "$ISSUE_ID" "$(jq -n --arg t "$(now)" \
+              '{properties:{factory_status:"queued", factory_queued_at:$t, assigned_agent:""}}')"
+            { echo "proceed=false"; echo "release=false"; } >> "$GITHUB_OUTPUT"
+          elif [ "$ISSUE_AGENT" != "$SLOT_ID" ]; then
+            echo "Issue $ISSUE_ID is owned by '$ISSUE_AGENT'. Releasing $SLOT_ID."
+            { echo "proceed=false"; echo "release=true"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "proceed=true"; echo "release=true"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read issue and Port context
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
+          PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+          PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+        run: |
+          source "$RUNNER_TEMP/port.sh"
+          gh issue view "$ISSUE_NUMBER" -R "$TARGET" --json title,body,labels > issue.json
+          # Best effort: pull ownership and operational context for the repo from Port's catalog.
+          jq -n --arg r "${{ inputs.target_repo }}" \
+            '{query:{combinator:"and", rules:[{relation:"repository", operator:"=", value:$r}]}}' \
+            | curl -sf -X POST "$PORT_API/blueprints/service/entities/search" \
+                -H "Authorization: Bearer $(port_token)" -H 'Content-Type: application/json' -d @- \
+            | jq '[.entities[]? | {service: .identifier, owning_team: .properties.owning_team,
+                                   tier: .properties.tier, runbook: .properties.runbook_url}]' \
+            > context.json || echo '[]' > context.json
+          gh issue comment "$ISSUE_NUMBER" -R "$TARGET" \
+            --body "🤖 **${SLOT_ID}** picked this up. [Follow the run](${RUN_URL})"
+
+      - name: Check out target repo
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET }}
+          token: ${{ secrets.FACTORY_GH_TOKEN }}
+          path: work
+          persist-credentials: false   # the agent never sees a git token
+
+      - name: Build prompt
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          {
+            echo "You are an autonomous software engineer working on GitHub issue #${ISSUE_NUMBER} in ${TARGET}."
+            echo
+            echo "## Issue title"
+            jq -r .title issue.json
+            echo
+            echo "## Issue description"
+            jq -r '.body // "(no description)"' issue.json
+            echo
+            echo "## Context from the Port catalog"
+            cat context.json
+            echo
+            echo "## Rules"
+            echo "- Make the smallest change that fully resolves the issue. Follow the repo's existing style."
+            echo "- Add or update tests when the repo has them, and run them if that is quick."
+            echo "- Do NOT run git commit, git push, or open a pull request. The pipeline does that."
+            echo "- Finish with a short summary of what you changed and why. It becomes the PR description."
+          } > prompt.md
+
+      - name: Run agent
+        id: agent
+        if: steps.guard.outputs.proceed == 'true'
+        working-directory: work
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          COST=0
+          if [ "$AGENT_TYPE" = "claude" ]; then
+            npm install -g @anthropic-ai/claude-code
+            claude -p "$(cat ../prompt.md)" --output-format json --dangerously-skip-permissions --max-turns 60 \
+              > ../agent.json || true
+            jq -r '.result // "No summary produced."' ../agent.json > ../summary.md 2>/dev/null \
+              || echo "No summary produced." > ../summary.md
+            COST=$(jq -r '.total_cost_usd // 0' ../agent.json 2>/dev/null || echo 0)
+          else
+            npm install -g @openai/codex
+            codex exec --full-auto --output-last-message ../summary.md "$(cat ../prompt.md)" || true
+            [ -s ../summary.md ] || echo "No summary produced." > ../summary.md
+          fi
+          echo "cost=$COST" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and open PR
+        id: pr
+        if: steps.guard.outputs.proceed == 'true'
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "outcome=no_changes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TITLE=$(jq -r .title ../issue.json)
+          BRANCH="agent/${SLOT_ID}/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git config user.name "factory-${SLOT_ID}"
+          git config user.email "factory-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "${TITLE} (#${ISSUE_NUMBER})" -m "Generated by ${SLOT_ID} (${AGENT_TYPE})."
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${TARGET}.git" "$BRANCH"
+          {
+            echo "Closes #${ISSUE_NUMBER}"
+            echo
+            cat ../summary.md
+            echo
+            echo "---"
+            echo "🤖 Agent: \`${SLOT_ID}\` (${AGENT_TYPE}) · [run log](${RUN_URL})"
+          } > ../pr_body.md
+          PR_URL=$(gh pr create -R "$TARGET" --head "$BRANCH" --title "[${SLOT_ID}] ${TITLE}" --body-file ../pr_body.md)
+          { echo "pr_url=$PR_URL"; echo "outcome=success"; } >> "$GITHUB_OUTPUT"
+
+      # Always runs: report back to Port and free the slot. Freeing the slot (last) is what
+      # triggers Port's queue-drain workflow to hand this slot the next queued issue.
+      - name: Report to Port and release slot
+        if: always() && steps.guard.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
+          PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+          PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+          PROCEED: ${{ steps.guard.outputs.proceed }}
+          OUTCOME: ${{ steps.pr.outputs.outcome }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          COST: ${{ steps.agent.outputs.cost }}
+        run: |
+          source "$RUNNER_TEMP/port.sh"
+          if [ "$PROCEED" != "true" ]; then
+            port_patch agentSlot "$SLOT_ID" '{"properties":{"status":"idle"},"relations":{"current_issue":null}}'
+            exit 0
+          fi
+          OUTCOME="${OUTCOME:-failed}"
+          if [ "$OUTCOME" = "success" ]; then
+            port_patch githubIssue "$ISSUE_ID" "$(jq -n --arg u "$PR_URL" \
+              '{properties:{factory_status:"pr_opened", factory_pr_url:$u}}')"
+          else
+            port_patch githubIssue "$ISSUE_ID" '{"properties":{"factory_status":"failed"}}'
+            gh issue comment "$ISSUE_NUMBER" -R "$TARGET" --body \
+              "⚠️ **${SLOT_ID}** finished without a PR (\`${OUTCOME}\`). [Run log](${RUN_URL}). Remove and re-add the \`agent\` label to retry." || true
+          fi
+          RUNS=$(port_get agentSlot "$SLOT_ID" | jq '.entity.properties.runs_completed // 0')
+          port_patch agentSlot "$SLOT_ID" "$(jq -n \
+            --arg o "$OUTCOME" --arg t "$(now)" --arg r "$RUN_URL" \
+            --argjson c "${COST:-0}" --argjson n "$RUNS" \
+            '{properties:{status:"idle", last_outcome:$o, last_released_at:$t, last_run_url:$r,
+                          last_cost_usd:$c, runs_completed:($n + 1)},
+              relations:{current_issue:null}}')"
